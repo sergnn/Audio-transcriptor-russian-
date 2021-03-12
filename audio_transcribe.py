@@ -10,236 +10,296 @@
 
 # To work with mp3-files you will need to install ffmpeg and put it to PATH.
 # Windows instruction here http://blog.gregzaal.com/how-to-install-ffmpeg-on-windows/
+import argparse
+import json
+import logging
+import sys
+from multiprocessing import Semaphore, Process
+from pathlib import Path
 
-# importing libraries 
-import speech_recognition as sr 
-import time
-import os
-import re
-from normalizer.normalizer import Normalizer # https://github.com/snakers4/russian_stt_text_normalization
- 
-from pydub.silence import split_on_silence
+import speech_recognition as sr
 from pydub import AudioSegment, effects
-from bert.bert_punctuation import Bert_punctuation # https://github.com/vlomme/Bert-Russian-punctuation don't forget to download pretrained bert model https://drive.google.com/file/d/190dLqhRjqgNJLKBqz0OxQ3TzxSm5Qbfx/view
+from pydub.silence import split_on_silence
+
+from bert.bert_punctuation import BertPunctuation  # https://github.com/vlomme/Bert-Russian-punctuation don't forget to download pretrained bert model https://drive.google.com/file/d/190dLqhRjqgNJLKBqz0OxQ3TzxSm5Qbfx/view
+from normalizer.normalizer import Normalizer  # https://github.com/snakers4/russian_stt_text_normalization
 
 # Settings
-source_format = 'mp3' # or 'wav' format of source audio file.
-symbols_gate = False # only chunks with normal symbol rate (symbols per second) will be used
-symbol_rate_min = 13 # min amount of symbols per second audio
-symbol_rate_max = 30 # max amount of symbols per second audio
-additional_clean = False # before use chunk will be send to google cloud, if google can not recognize words in this chunk, it will be not used. True will consume additional time.
-Speaker_id = 'R001_' # if you have many speakers, you can give each speaker an unique speaker id.
-min_silence_len = 500 # silence duration for cut in ms. If the speaker stays silent for longer, increase this value. else, decrease it.
-silence_thresh = -36 # consider it silent if quieter than -36 dBFS. Adjust this per requirement.
-keep_silence = 100 # keep some ms of leading/trailing silence.
-frame_rate = 16000 # set the framerate of result audio.
-target_length = 1000 # min target length of output audio files in ms.
-punctuation = False # will add commas in text. Set it to False if you use other language as russian.
+SOURCE_FORMAT = 'mp3'  # or 'wav' format of source audio file.
+SYMBOLS_GATE = False  # only chunks with normal symbol rate (symbols per second) will be used
+SYMBOL_RATE_MIN = 13  # min amount of symbols per second audio
+SYMBOL_RATE_MAX = 30  # max amount of symbols per second audio
+ADDITIONAL_CLEAN = False  # before use chunk will be send to google cloud, if google can not recognize words in this chunk, it will be not used. True will consume additional time.
+MIN_SILENCE_LEN = 500  # silence duration for cut in ms. If the speaker stays silent for longer, increase this value. else, decrease it.
+SILENCE_THRESH = -36  # consider it silent if quieter than -36 dBFS. Adjust this per requirement.
+KEEP_SILENCE = 100  # keep some ms of leading/trailing silence.
+FRAME_RATE = 16000  # set the framerate of result audio.
+TARGET_LENGTH = 1000  # min target length of output audio files in ms.
+PUNCTUATION = False  # will add commas in text. Set it to False if you use other language as russian.
 
-# Load pretrained models
-norm = Normalizer()
-Bert_punctuation = Bert_punctuation()
+PROCESSES_NUM = 5  # Parallel processes
 
-# a function that splits the audio file into chunks 
-# and applies speech recognition 
-def silence_based_conversion(path): 
+LOG_DIR = Path(__file__).parent / 'logs'
+LOG_DIR.mkdir(exist_ok=True)
 
-	# open the audio file stored in the local system
-	if source_format == 'wav':
-		song = AudioSegment.from_wav(path)
-		song = song.set_channels(1)
-	else:
-		song = AudioSegment.from_file(path, "mp3")
-		song = song.set_channels(1)
-		
-	# set the framerate of result autio
-	song = song.set_frame_rate(frame_rate)
-		
-	# split track where silence is 0.5 seconds or more and get chunks 
-	chunks = split_on_silence(song, min_silence_len, silence_thresh, keep_silence) 
-
-	# create a directory to store the metadata.csv. 
-	try: 
-		os.mkdir('LJSpeech-1.1') 
-	except(FileExistsError): 
-		pass
-
-	# create a directory to store the audio chunks. 
-	try: 
-		os.mkdir('LJSpeech-1.1/wavs') 
-	except(FileExistsError): 
-		pass
-
-	# open a file where we will concatenate and store the recognized text 
-	fh = open("LJSpeech-1.1/metadata.csv", "a+", encoding="utf-8")
-	
-	# move into the directory to store the audio files. 
-	os.chdir('LJSpeech-1.1/wavs')
-
-	# additional clean. Use it if you want to remove chunks without speech.
-	if additional_clean == True:
-		checked_chunks = [chunks[0]]
-		# check each chunk 
-		for chunk in chunks: 
-
-			# Create 1000 milliseconds silence chunk 
-			# Silent chunks (1000ms) are needed for correct working google recognition
-			chunk_silent = AudioSegment.silent(duration = 1000) 
-
-			# Add silent chunk to beginning and end of audio chunk.
-			# This is done so that it doesn't seem abruptly sliced. 
-			# We will send this chunk to google recognition service
-			audio_chunk_temp = chunk_silent + chunk + chunk_silent 
-
-			# specify the bitrate to be 192k
-			# save chunk for google recognition as temp.wav
-			audio_chunk_temp.export("./check_temp.wav", bitrate ='192k', format ="wav") 
-
-			# get the name of the newly created chunk 
-			# in the AUDIO_FILE variable for later use. 
-			file = 'check_temp.wav'
-
-			# create a speech recognition object 
-			r = sr.Recognizer() 
-
-			# recognize the chunk 
-			with sr.AudioFile(file) as source: 
-				# remove this if it is not working correctly. 
-				r.adjust_for_ambient_noise(source) 
-				audio_listened = r.listen(source) 
-
-				try: 
-					# try converting it to text 
-					# if you use other language as russian, correct the language as described here https://cloud.google.com/speech-to-text/docs/languages
-					rec = r.recognize_google(audio_listened, language="ru-RU").lower()
-					checked_chunks.append(chunk)
-					print("checking chunk - passed")
-				except sr.UnknownValueError: 
-					print("checking chunk - not passed") 
-
-				except sr.RequestError as e: 
-					print("--- Could not request results. check your internet connection") 
-					# finaly remove the temp-file
-			os.remove('./check_temp.wav')
-		
-		chunks = checked_chunks
-        
-	# now recombine the chunks so that the parts are at least "target_length" long
-	output_chunks = [chunks[0]]
-	for chunk in chunks[1:]:
-		if len(output_chunks[-1]) < target_length:
-			output_chunks[-1] += chunk
-		else:
-			output_chunks.append(chunk)
-
-	chunks = output_chunks			
-
-	# process each chunk 
-	for chunk in chunks: 
-		i = str(time.time()) # needed for unique filename
-		i = i.replace('.','')
-
-		# Create 1000 milliseconds silence chunk 
-		# Silent chunks (1000ms) are needed for correct working google recognition
-		chunk_silent = AudioSegment.silent(duration = 1000) 
-
-		# Add silent chunk to beginning and end of audio chunk.
-		# This is done so that it doesn't seem abruptly sliced. 
-		# We will send this chunk to google recognition service
-		audio_chunk_temp = chunk_silent + chunk + chunk_silent 
-
-		# This chunk will be stored
-		audio_chunk = chunk 
-
-		# export audio chunk and save it in the current directory.
-		# normalize the loudness in audio 
-		audio_chunk = effects.normalize(audio_chunk)
-
-		# specify the bitrate to be 192k
-		# save chunk for google recognition as temp.wav
-		audio_chunk_temp.export("./temp.wav", bitrate ='192k', format ="wav") 
-
-		# the name of the newly created chunk 
-		filename = Speaker_id+str(i)
-		print("Processing "+filename) 
-
-		# get the name of the newly created chunk 
-		# in the AUDIO_FILE variable for later use. 
-		file = 'temp.wav'
-
-		# create a speech recognition object 
-		r = sr.Recognizer() 
-
-		# recognize the chunk 
-		with sr.AudioFile(file) as source: 
-			# remove this if it is not working correctly. 
-			r.adjust_for_ambient_noise(source) 
-			audio_listened = r.listen(source) 
+PROGRESS_FILE = Path('progress.json')
 
 
-		try: 
-			# try converting it to text 
-			# if you use other language as russian, correct the language as described here https://cloud.google.com/speech-to-text/docs/languages
-			rec = r.recognize_google(audio_listened, language="ru-RU").lower()
+def config_logger(name: str, filename: str) -> logging.Logger:
+    """Configure logger"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
 
-			# google recognition return numbers as integers i.e. "1, 200, 35".
-			# text normalization will read this numbers and return this as a writen russian text i.e. "один, двести, тридцать пять"
-			# if you use other language as russian, repalce this line 
-			rec = norm.norm_text(rec)
+    formatter = logging.Formatter(f'{name}: %(message)s')
 
-				#bert punctuation - will place commas in text
-			if punctuation == True:
-				rec = [rec]
-				rec = Bert_punctuation.predict(rec)
-				rec = (rec [0])
+    fh = logging.FileHandler(LOG_DIR / f'{filename}.log', encoding='utf-8')
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
 
-			audio_length_ms = len(audio_chunk) # in milliseconds
-			audio_length_sec = float(len(audio_chunk))/1000 # in seconds
-			symbol_count = float(len(rec))
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(formatter)
 
-			# here starts the filtering on symbol rate
-			if symbols_gate == True:
-				if (symbol_count / audio_length_sec > symbol_rate_min) and (symbol_count / audio_length_sec < symbol_rate_max):
-					rate = int(symbol_count/audio_length_sec)
-					print ("Symbol rate "+str(rate))
-					# write the output to the metadata.csv.
-					# in the same manner as in LJSpeech-1.1
-					fh.write(filename+'|'+rec+'|'+rec+'|'+str(rate)+'|'+str(audio_length_ms)+"\n") 
-					#fh.write(filename+'|'+rec+'|'+rec+"\n")
+    logger.addHandler(handler)
+    logger.addHandler(fh)
+    return logger
 
-					# save audio file
-					audio_chunk.export("./"+Speaker_id+"{0}.wav".format(i), bitrate ='192k', format ="wav") 
-					# catch any errors. Audio files with errors will be not mentioned in metadata.csv
-				else: 
-					print("- text too short or too long")
-			else:
-				# write the output to the metadata.csv.
-				# in the same manner as in LJSpeech-1.1
-				fh.write(filename+'|'+rec+'|'+rec+"\n") 
 
-				# save audio file
-				audio_chunk.export("./"+Speaker_id+"{0}.wav".format(i), bitrate ='192k', format ="wav") 
-				# catch any errors. Audio files with errors will be not mentioned in metadata.csv
+def silence_based_conversion(input_audio: Path, output_dir: Path, start_index: int) -> int:
+    """function that splits the audio file into chunks and applies speech recognition"""
+    author = input_audio.parent.parts[-1]
+    rel_input = input_audio.relative_to(input_audio.parents[1])
 
-		except sr.UnknownValueError: 
-			print("-- Could not understand audio") 
+    logger = config_logger(str(rel_input), str(author))
 
-		except sr.RequestError as e: 
-			print("--- Could not request results. Check your internet connection") 
+    try:
+        progress = json.loads(PROGRESS_FILE.read_text(encoding='utf-8'))
+        if progress.get(str(rel_input)):
+            logger.info('Already processed, skipping')
+            return progress.get(str(rel_input))
+    except FileNotFoundError:
+        pass
 
-		# finaly remove the temp-file
-		os.remove('./temp.wav')
+    # open the audio file stored in the local system
+    if SOURCE_FORMAT == 'wav':
+        logger.info('Opening')
+        song = AudioSegment.from_wav(input_audio)
+    else:
+        logger.info('Converting to WAV')
+        song = AudioSegment.from_file(input_audio, 'mp3')
 
-	os.chdir('..')
-	os.chdir('..') 
+    song = song.set_channels(1)
 
-if __name__ == '__main__': 
-	print('Start') 
-	for k in range (1,99): 
-		path = "{:02d}.mp3".format(k)
-		print("{:02d}.mp3".format(k))
-		try:
-			open(path)
-			silence_based_conversion(path) 
-		except FileNotFoundError:
-			print("File {} not found".format(path))
+    # set the framerate of result autio
+    song = song.set_frame_rate(FRAME_RATE)
+
+    # split track where silence is 0.5 seconds or more and get chunks
+    logger.info('Splitting to chunks')
+    chunks = split_on_silence(song, MIN_SILENCE_LEN, SILENCE_THRESH, KEEP_SILENCE)
+
+    # create a directory to store output files
+    splitted = output_dir / author
+
+    if splitted.exists():
+        logger.info('Conversion was aborted. Continue...')
+
+    splitted.mkdir(exist_ok=True)
+
+    chunk_file = splitted / 'check_temp.wav'
+    temp_file = splitted / 'temp.wav'
+    metadata_file = splitted / 'metadata.csv'
+
+    # additional clean. Use it if you want to remove chunks without speech.
+    if ADDITIONAL_CLEAN:
+        checked_chunks = [chunks[0]]
+        # check each chunk
+        for chunk in chunks:
+            # Create 1000 milliseconds silence chunk
+            # Silent chunks (1000ms) are needed for correct working google recognition
+            chunk_silent = AudioSegment.silent(duration=1000)
+
+            # Add silent chunk to beginning and end of audio chunk.
+            # This is done so that it doesn't seem abruptly sliced.
+            # We will send this chunk to google recognition service
+            audio_chunk_temp = chunk_silent + chunk + chunk_silent
+
+            # specify the bitrate to be 192k
+            # save chunk for google recognition as temp.wav
+            audio_chunk_temp.export(chunk_file, bitrate='192k', format='wav')
+
+            # create a speech recognition object
+            r = sr.Recognizer()
+
+            # recognize the chunk
+            with sr.AudioFile(str(chunk_file)) as source:
+                # remove this if it is not working correctly.
+                r.adjust_for_ambient_noise(source)
+                audio_listened = r.listen(source)
+
+                try:
+                    # try converting it to text
+                    # if you use other language as russian, correct the language as described here https://cloud.google.com/speech-to-text/docs/languages
+                    r.recognize_google(audio_listened, language='ru-RU')
+                    checked_chunks.append(chunk)
+                    logger.info('checking chunk - passed')
+                except sr.UnknownValueError:
+                    logger.info('checking chunk - not passed')
+
+                except sr.RequestError:
+                    logger.info('--- Could not request results. check your internet connection')
+
+            # finaly remove the temp-file
+            chunk_file.unlink()
+
+        chunks = checked_chunks
+
+    # now recombine the chunks so that the parts are at least "target_length" long
+    output_chunks = [chunks[0]]
+    for chunk in chunks[1:]:
+        if len(output_chunks[-1]) < TARGET_LENGTH:
+            output_chunks[-1] += chunk
+        else:
+            output_chunks.append(chunk)
+
+    chunks = output_chunks
+
+    logger.info(f'Found {len(chunks)} chunks')
+
+    # Load pretrained models
+    norm = Normalizer()
+
+    # process each chunk
+    for counter, chunk in enumerate(chunks, start_index):
+        output_file = splitted / f'{author}_{counter:04d}.wav'
+        if output_file.exists():
+            logger.info(f'{output_file.relative_to(splitted)} already processed, skipping.')
+            continue
+
+        # Create 1000 milliseconds silence chunk
+        # Silent chunks (1000ms) are needed for correct working google recognition
+        chunk_silent = AudioSegment.silent(duration=1000)
+
+        # Add silent chunk to beginning and end of audio chunk.
+        # This is done so that it doesn't seem abruptly sliced.
+        # We will send this chunk to google recognition service
+        audio_chunk_temp = chunk_silent + chunk + chunk_silent
+
+        # This chunk will be stored
+        audio_chunk = chunk
+
+        # export audio chunk and save it in the current directory.
+        # normalize the loudness in audio
+        audio_chunk = effects.normalize(audio_chunk)
+
+        # specify the bitrate to be 192k
+        # save chunk for google recognition as temp.wav
+        audio_chunk_temp.export(temp_file, bitrate='192k', format='wav')
+
+        logger.info(f'Processing {output_file.relative_to(splitted)}')
+
+        # create a speech recognition object
+        r = sr.Recognizer()
+
+        # recognize the chunk
+        with sr.AudioFile(str(temp_file)) as source:
+            # remove this if it is not working correctly.
+            r.adjust_for_ambient_noise(source)
+            audio_listened = r.listen(source)
+
+        try:
+            # try converting it to text
+            # if you use other language as russian, correct the language as described here https://cloud.google.com/speech-to-text/docs/languages
+            rec = r.recognize_google(audio_listened, language='ru-RU').lower()
+
+            # google recognition return numbers as integers i.e. "1, 200, 35".
+            # text normalization will read this numbers and return this as a writen russian text i.e. "один, двести, тридцать пять"
+            # if you use other language as russian, repalce this line
+            rec = norm.norm_text(rec)
+
+            # bert punctuation - will place commas in text
+            if PUNCTUATION:
+                rec = [rec]
+                rec = BertPunctuation().predict(rec)
+                rec = (rec[0])
+
+            audio_length_ms = len(audio_chunk)  # in milliseconds
+            audio_length_sec = float(len(audio_chunk)) / 1000  # in seconds
+            symbol_count = float(len(rec))
+
+            # here starts the filtering on symbol rate
+            if SYMBOLS_GATE:
+                if (symbol_count / audio_length_sec > SYMBOL_RATE_MIN) and (symbol_count / audio_length_sec < SYMBOL_RATE_MAX):
+                    rate = int(symbol_count / audio_length_sec)
+                    logger.info(f'Symbol rate {rate}')
+                    # write the output to the metadata.csv.
+                    with metadata_file.open(mode='a+', encoding='utf=8') as f:
+                        f.write(f'{output_file.name}|{rec}|{rec}|{rate}|{audio_length_ms}\n')
+
+                    # save audio file & update progress
+                    audio_chunk.export(output_file, bitrate='192k', format='wav')
+
+                else:
+                    logger.info('- text too short or too long')
+            else:
+                # write the output to the metadata.csv.
+                with metadata_file.open(mode='a+', encoding='utf=8') as f:
+                    f.write(f'{output_file.name}|{rec}|{rec}\n')
+
+                # save audio file & update progress
+                audio_chunk.export(output_file, bitrate='192k', format='wav')
+
+        # catch any errors. Audio files with errors will be not mentioned in metadata.csv
+        except sr.UnknownValueError:
+            logger.info('-- Could not understand audio')
+
+        except sr.RequestError:
+            logger.info('--- Could not request results. Check your internet connection')
+
+        # finaly remove the temp-file
+        temp_file.unlink()
+
+    try:
+        progress = json.loads(PROGRESS_FILE.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        progress = {}
+
+    progress[str(rel_input)] = len(chunks)
+    PROGRESS_FILE.write_text(json.dumps(progress, ensure_ascii=False, indent=4), encoding='utf-8')
+
+    return progress[str(rel_input)]
+
+
+def process_dir(directory: Path, output_dir: Path):
+    """Process all audio files in directory"""
+    last_index = 0
+    for audio_file in directory.glob(f'*.{SOURCE_FORMAT}'):
+        last_index = silence_based_conversion(audio_file, output_dir, last_index + 1)
+
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input_dir', help='Input dir')
+    parser.add_argument('output_dir', help='Output dir')
+    args = parser.parse_args()
+
+    # get dirs to process
+    output_dir = Path(args.output_dir)
+
+    sema = Semaphore(PROCESSES_NUM)
+    all_processes = []
+
+    for author in Path(args.input_dir).glob('*'):
+        if author.is_dir():
+            sema.acquire()
+            p = Process(target=process_dir, args=(author, output_dir))
+            all_processes.append(p)
+            p.start()
+
+    for p in all_processes:
+        p.join()
+
+
+if __name__ == '__main__':
+    main()
