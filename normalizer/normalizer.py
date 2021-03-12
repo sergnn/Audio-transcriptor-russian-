@@ -10,7 +10,7 @@ from tqdm import tqdm
 class Normalizer:
     def __init__(self,
                  device='cpu',
-                 jit_model=Path('normalizer') / 'jit_s2s.pt'):
+                 jit_model=Path(__file__).parent / 'jit_s2s.pt'):
         super(Normalizer, self).__init__()
 
         self.device = torch.device(device)
