@@ -104,7 +104,7 @@ def silence_based_conversion(input_audio: Path, output_dir: Path, start_index: i
     if splitted.exists():
         logger.info('Conversion was aborted. Continue...')
 
-    splitted.mkdir(exist_ok=True)
+    splitted.mkdir(exist_ok=True, parents=True)
 
     chunk_file = splitted / 'check_temp.wav'
     temp_file = splitted / 'temp.wav'
@@ -270,11 +270,12 @@ def silence_based_conversion(input_audio: Path, output_dir: Path, start_index: i
     return progress[str(rel_input)]
 
 
-def process_dir(directory: Path, output_dir: Path):
+def process_dir(directory: Path, output_dir: Path, semaphore: Semaphore):
     """Process all audio files in directory"""
-    last_index = 0
-    for audio_file in directory.glob(f'*.{SOURCE_FORMAT}'):
-        last_index = silence_based_conversion(audio_file, output_dir, last_index + 1)
+    with semaphore:
+        last_index = 0
+        for audio_file in directory.glob(f'*.{SOURCE_FORMAT}'):
+            last_index = silence_based_conversion(audio_file, output_dir, last_index + 1)
 
 
 def main():
@@ -287,13 +288,12 @@ def main():
     # get dirs to process
     output_dir = Path(args.output_dir)
 
-    sema = Semaphore(PROCESSES_NUM)
+    semaphore = Semaphore(PROCESSES_NUM)
     all_processes = []
 
     for author in Path(args.input_dir).glob('*'):
         if author.is_dir():
-            sema.acquire()
-            p = Process(target=process_dir, args=(author, output_dir))
+            p = Process(target=process_dir, args=(author, output_dir, semaphore))
             all_processes.append(p)
             p.start()
 
